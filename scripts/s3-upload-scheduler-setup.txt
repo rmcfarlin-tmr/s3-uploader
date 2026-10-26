@@ -1,0 +1,291 @@
+S3 UPLOADER - SETUP, TEST & REFERENCE (macOS)
+=============================================
+
+Images dropped in ~/S3_Uploader/upload are backed up locally, then uploaded
+to S3 after a buffer (default 10 min). A background job (launchd) runs every
+60 seconds while the Mac is on, awake, and logged into this user account.
+Staff use the "S3 Uploader" app; no Terminal needed once installed.
+
+WHERE EVERYTHING LIVES
+----------------------
+Staff folder:      ~/S3_Uploader/
+                     upload/       <- Photoshop exports here
+                     backups/      <- default backup folder (changeable in app)
+                     logs/         <- all logs (see below)
+App folder:        ~/Library/Application Support/S3Uploader/
+                     upload.sh     <- the job (backup + upload)
+                     s3uploader.py <- the app
+                     app.config    <- settings (BACKUP_DIR, BUFFER_MIN)
+Job file (plist):  ~/Library/LaunchAgents/com.tmraudio.s3upload.plist
+Job name (label):  com.tmraudio.s3upload
+Launcher app:      ~/Applications/S3 Uploader.app
+rclone:            /usr/local/bin/rclone   (config: ~/.config/rclone/rclone.conf)
+
+Logs (new file every half day, folder per month):
+  ~/S3_Uploader/logs/upload_logs/upload_logs_YYYY-MM/upload_log_YYYY-MM-DD_AM.log
+  ~/S3_Uploader/logs/backup_logs/backup_logs_YYYY-MM/backup_log_YYYY-MM-DD_PM.log
+  ~/S3_Uploader/logs/launchd-error.log    (only if the script itself fails to start)
+
+Notes:
+- No sudo anywhere in this process (except installing rclone).
+- Never put the staff folder, app folder, or backup folder in Desktop,
+  Documents, Downloads, iCloud, Dropbox, or an external drive. macOS blocks
+  background jobs there and the job fails. Use Finder sidebar / Dock
+  shortcuts for easy access instead.
+- Paste each command as ONE line.
+
+
+====================================================
+1. PREREQUISITES (once per Mac)
+====================================================
+
+a) Install rclone (asks for your Mac password):
+    sudo -v ; curl https://rclone.org/install.sh | sudo bash
+    which rclone                 -> should print /usr/local/bin/rclone
+
+b) Connect rclone to S3 - use the SCOPED upload key, not the full-access key:
+    rclone config
+      n -> name: tmr-s3 -> storage: s3 -> provider: AWS -> env_auth: false
+      access_key_id / secret_access_key: from the password manager
+      region: us-east-2   endpoint: (blank)   location_constraint: us-east-2
+      acl: (blank)   everything else: defaults -> y to save -> q to quit
+    rclone config update tmr-s3 no_check_bucket true
+
+c) Test the connection (read-only, should list real filenames):
+    rclone lsf tmr-s3:tmraudio-product-images/product_images/2026/ | head
+
+d) Python 3.9+ with Tk 8.6+ (python.org installer recommended):
+    which python3
+    python3 -c "import sys, tkinter; print(sys.version, tkinter.TkVersion)"
+
+e) If the package was AirDropped / downloaded, clear the "downloaded" flag:
+    xattr -dr com.apple.quarantine /path/to/S3_Uploader_pkg
+
+
+====================================================
+2. INSTALL
+====================================================
+
+Check scripts/upload.sh has the right DEST line active (only one uncommented):
+    TEST:  DEST="tmr-s3:tmraudio-product-images/rclone_test/$(date +%Y)/"
+    LIVE:  DEST="tmr-s3:tmraudio-product-images/product_images/$(date +%Y)/"
+
+Then run the installer (deactivate any Python venv first):
+    bash /path/to/S3_Uploader_pkg/scripts/install.sh
+
+To use a specific Python:
+    PYTHON=/path/to/python3 bash /path/to/S3_Uploader_pkg/scripts/install.sh
+
+The installer:
+- checks Python/Tk, rclone, and the tmr-s3 remote
+- shows the upload destination (TEST or LIVE) and asks you to type "yes"
+- creates the folders, copies upload.sh + s3uploader.py into the app folder
+- writes app.config ONLY if it doesn't exist (re-running keeps settings)
+- writes the plist (every 60 s) and loads the job
+- builds the "S3 Uploader" launcher and opens it in Finder
+
+Safe to re-run any time to update or repair. Stops with a message if any
+step fails.
+
+
+====================================================
+3. VERIFY THE INSTALL
+====================================================
+
+Job is registered:
+    launchctl print gui/$(id -u)/com.tmraudio.s3upload | grep -E "state|runs|last exit"
+
+Right after install this is CORRECT (waiting for its first 60 s timer):
+    state = not running
+    runs = 0
+    last exit code = (never exited)
+
+"Could not find service" means it is NOT loaded - re-run install.sh.
+
+Open "S3 Uploader": status should be green "Running" and show the backup
+folder. No Terminal window should appear.
+
+
+====================================================
+4. END-TO-END TEST (with the TEST destination)
+====================================================
+
+Tip: in the app, Set Upload Buffer Time -> 2 minutes while testing.
+
+a) Add an image that is NOT already in the test folder in S3:
+    cp /path/to/some.jpg ~/S3_Uploader/upload/sched-test-1.jpg
+    touch ~/S3_Uploader/upload/sched-test-1.jpg
+
+   ("touch" sets the modified date to now - the buffer counts from that.)
+
+b) Wait. Within ~1-2 min it appears in the backup folder. After the buffer
+   (+ up to 1 min) it uploads and disappears from the upload folder.
+   To skip waiting for the timer once the buffer has passed:
+    launchctl kickstart gui/$(id -u)/com.tmraudio.s3upload
+
+c) Check the result:
+    launchctl print gui/$(id -u)/com.tmraudio.s3upload | grep -E "runs|last exit"
+    grep -h "Copied" ~/S3_Uploader/logs/upload_logs/*/*.log | tail -5
+    cat ~/S3_Uploader/logs/launchd-error.log 2>/dev/null
+    rclone lsf tmr-s3:tmraudio-product-images/rclone_test/2026/
+
+   Success looks like:
+   - last exit code = 0
+   - an upload log line with "Copied (new)" and "sched-test-1.jpg"
+   - launchd-error.log empty or missing
+   - the file is in the S3 listing and the backup folder, and GONE from
+     ~/S3_Uploader/upload
+   - the app's "Total Files Uploaded" went up by 1
+
+d) Duplicate-name test: put a copy of a file that's ALREADY in the test
+   folder in S3 into ~/S3_Uploader/upload. It should be backed up but NOT
+   uploaded, and stay in the upload folder (--ignore-existing protecting
+   the live image).
+
+e) Stop/Start test: click Stop in the app -> "Stopped". Restart the Mac ->
+   still stopped. Click Start -> "Running".
+
+f) Failure test: in the app, change the backup folder to a new folder, then
+   delete that folder in Finder. Within a minute the status turns orange
+   (Error) and the backup folder line shows MISSING. Change it back.
+
+Set the buffer back (e.g. 10 min) when done.
+
+
+====================================================
+DAY-TO-DAY REFERENCE
+====================================================
+
+Status, Start/Stop, backup folder, and buffer are all in the app.
+Terminal versions for troubleshooting:
+
+Status:
+    launchctl print gui/$(id -u)/com.tmraudio.s3upload | grep -E "state|runs|last exit"
+
+Run now:
+    launchctl kickstart gui/$(id -u)/com.tmraudio.s3upload
+
+Stop (stays stopped after restart - same as the app's Stop button):
+    launchctl disable gui/$(id -u)/com.tmraudio.s3upload
+    launchctl bootout gui/$(id -u)/com.tmraudio.s3upload
+
+Start (same as the app's Start button):
+    launchctl enable gui/$(id -u)/com.tmraudio.s3upload
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tmraudio.s3upload.plist
+
+Recent uploads / backups:
+    grep -h "Copied" ~/S3_Uploader/logs/upload_logs/*/*.log | tail -20
+    grep -h "Copied" ~/S3_Uploader/logs/backup_logs/*/*.log | tail -20
+
+Recent errors (script messages + rclone errors):
+    grep -h -i -E "error|skipping|failed" ~/S3_Uploader/logs/*_logs/*/*.log | tail -20
+
+Current settings:
+    cat ~/Library/Application\ Support/S3Uploader/app.config
+
+Stop a stuck rclone run (safe - interrupted uploads never appear in S3,
+and local files are only removed after a successful upload):
+    pgrep -l rclone
+    pkill rclone
+
+Check uploads from another machine (read-only):
+    rclone lsf tmr-s3:tmraudio-product-images/product_images/2026/ --max-age 1d --use-server-modtime
+
+
+====================================================
+TROUBLESHOOTING
+====================================================
+
+Status "Stopped" and nobody pressed Stop:
+    Use the Start button, or re-run install.sh.
+
+Status orange "Error":
+    Check "Recent errors" above. Common causes:
+    - backup folder missing / moved -> pick it again in the app
+    - backup folder in a protected location -> pick one in the home folder
+    - AWS key changed or revoked -> rclone config (edit tmr-s3)
+    - no internet -> clears itself on the next successful run
+
+Image stuck in the upload folder past the buffer:
+    Almost always a file with that name is already in S3 (never overwritten
+    automatically). Rename it, or replace the live image in Cyberduck.
+
+"bootstrap" says "Input/output error" or "Service is disabled":
+    launchctl enable gui/$(id -u)/com.tmraudio.s3upload
+    launchctl bootout gui/$(id -u)/com.tmraudio.s3upload
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tmraudio.s3upload.plist
+
+App won't open from the launcher:
+    Run it directly to see the error:
+    python3 ~/Library/Application\ Support/S3Uploader/s3uploader.py
+    If Python was moved or upgraded, re-run install.sh to rebuild the launcher.
+
+
+====================================================
+UPDATING
+====================================================
+
+Copy the new package over and re-run install.sh. Settings (app.config) are
+kept and uploads keep running. Quit and reopen the app to see app changes.
+
+Editing upload.sh in the app folder directly takes effect on the next run,
+but the next install.sh will overwrite it with the package copy - make
+changes in the package instead.
+
+
+====================================================
+UNINSTALL / CLEAN SLATE
+====================================================
+
+    launchctl bootout gui/$(id -u)/com.tmraudio.s3upload 2>/dev/null
+    launchctl enable gui/$(id -u)/com.tmraudio.s3upload
+    rm -f ~/Library/LaunchAgents/com.tmraudio.s3upload.plist
+    rm -rf ~/Applications/S3\ Uploader.app
+    launchctl print gui/$(id -u)/com.tmraudio.s3upload   -> "Could not find service"
+
+Then MOVE (don't delete - they hold backups and settings) as needed:
+    mv ~/S3_Uploader ~/S3_Uploader_old
+    mv ~/Library/Application\ Support/S3Uploader ~/S3Uploader_app_old
+
+Remove the saved AWS keys from this Mac:
+    rclone config delete tmr-s3
+
+Remove TEST uploads from S3. Run --dry-run first and confirm it ONLY lists
+files under rclone_test/. Copy the path exactly - a shortened path could
+delete live images:
+    rclone delete tmr-s3:tmraudio-product-images/rclone_test/ --dry-run
+    rclone delete tmr-s3:tmraudio-product-images/rclone_test/
+
+
+====================================================
+GOING LIVE (WAREHOUSE MAC) CHECKLIST
+====================================================
+
+AWS (once):
+[ ] Bucket versioning ON + lifecycle rule expiring old versions (30-90 days)
+[ ] Scoped key (PutObject/GetObject/ListBucket on product_images/ only)
+    tested: upload works, delete gives "Access Denied"
+
+Mac:
+[ ] Scoped key in rclone on this Mac (full-access key stays in Cyberduck)
+[ ] upload.sh: LIVE DEST active, TEST DEST commented out (installer shows LIVE)
+[ ] install.sh finished with no [x] errors
+[ ] Test: one new image uploads; one already-in-S3 image is skipped
+[ ] Photoshop export/action points to ~/S3_Uploader/upload
+[ ] Upload + backup folders in the Finder sidebar; launcher in the Dock
+[ ] System Settings > General > Login Items > "Allow in the Background":
+    the job (may show as "bash") is ON
+[ ] System Settings > Energy: "Prevent automatic sleeping when the display
+    is off" ON, and "Start up automatically after a power failure" ON
+[ ] Backup retention decided (~700 MB/day)
+
+Team briefing:
+[ ] Anything in the upload folder goes LIVE after the buffer
+[ ] The buffer is the window to fix or remove an image
+[ ] Re-exports with the same name after upload are NOT uploaded - replace
+    those in Cyberduck
+[ ] Don't use the upload folder and Cyberduck for the same image
+[ ] A user must be logged in for uploads to run
+[ ] Don't turn off the background item in Login Items
+[ ] After a major macOS update, check the app still shows "Running"
+[ ] If AWS keys ever change, update both Cyberduck and rclone on this Mac
