@@ -2,26 +2,29 @@
 CONFIG="$HOME/Library/Application Support/S3Uploader/app.config"
 [ -f "$CONFIG" ] && source "$CONFIG"
 
+FAILED=0
+
+YEAR="$(date +%Y)"
+MONTH="$(date +%Y-%m)"
+DAY="$(date +%Y-%m-%d)"
+
 STAFF_DIR="$HOME/S3_Uploader"
-SRC="$STAFF_DIR/upload"
-DEST="tmr-s3:tmraudio-product-images/rclone_test/$(date +%Y)/"   # test
-# DEST="tmr-s3:tmraudio-product-images/product_images/$(date +%Y)/"            # prod
+SRC="$STAFF_DIR/images/$MONTH/$DAY"
+DEST="tmr-s3:tmraudio-product-images/rclone_test"   # test
+# DEST="tmr-s3:tmraudio-product-images/product_images"            # prod
 
 RCLONE=/usr/local/bin/rclone
 
-MONTH="$(date +%Y-%m)"
-# AM/PM from the hour, so log names don't depend on the Mac's language settings
-if [ "$(date +%H)" -lt 12 ]; then AMPM=AM; else AMPM=PM; fi
-HALF_DAY="$(date +%Y-%m-%d)_$AMPM"
-
-BACKUP_LOG_DEST="$STAFF_DIR/logs/backup_logs/backup_logs_$MONTH"
-BACKUP_LOG_FILENAME="$BACKUP_LOG_DEST/backup_log_$HALF_DAY.log"
+YESTERDAY="$(date -v-1d +%Y-%m-%d)"        
+YESTERDAY_MONTH="$(date -v-1d +%Y-%m)"    
+YESTERDAY_YEAR="$(date -v-1d +%Y)"       
+YESTERDAY_SRC="$STAFF_DIR/images/$YESTERDAY_MONTH/$YESTERDAY"
 
 LOG_DEST="$STAFF_DIR/logs/upload_logs/upload_logs_$MONTH"
-LOG_FILENAME="$LOG_DEST/upload_log_$HALF_DAY.log"
+LOG_FILENAME="$LOG_DEST/upload_log_$DAY.log"
 
 # recreate every run just in case they get deleted / moved
-mkdir -p "$SRC" "$LOG_DEST" "$BACKUP_LOG_DEST"
+mkdir -p "$SRC" "$LOG_DEST" "$STAFF_DIR"
 
 BUFFER_MIN="${BUFFER_MIN:-10}"
 if ! [[ "$BUFFER_MIN" =~ ^[0-9]+$ ]] || [ "$BUFFER_MIN" -lt 2 ] || [ "$BUFFER_MIN" -gt 60 ]; then
@@ -29,32 +32,23 @@ if ! [[ "$BUFFER_MIN" =~ ^[0-9]+$ ]] || [ "$BUFFER_MIN" -lt 2 ] || [ "$BUFFER_MI
   BUFFER_MIN=10
 fi
 
-if [ -z "$BACKUP_DIR" ]; then
-  BACKUP_DIR="$STAFF_DIR/backups"
-  mkdir -p "$BACKUP_DIR"                     
-fi
+if [ -d "$YESTERDAY_SRC" ]; then
 
-if [ ! -d "$BACKUP_DIR" ]; then
-  echo "$(date) backup folder missing: '$BACKUP_DIR' - skipping run" >> "$BACKUP_LOG_FILENAME"
-  exit 1
-fi
-
-BACKUP_DEST="$BACKUP_DIR/$HALF_DAY"
-mkdir -p "$BACKUP_DEST" || {                   
-  echo "$(date) can't write to backup folder: '$BACKUP_DIR' - skipping run" >> "$BACKUP_LOG_FILENAME"
-  exit 1
-}
-
-# Back up
-"$RCLONE" copy "$SRC" "$BACKUP_DEST" \
-  --min-age 1m --max-depth 1 --ignore-case \
-  --include "*.jpg" \
-  --log-file "$BACKUP_LOG_FILENAME" --use-json-log --log-level INFO --stats-log-level DEBUG \
-  || { echo "$(date) backup failed - skipping upload" >> "$BACKUP_LOG_FILENAME"; exit 1; }
-
-#  Upload
-"$RCLONE" move "$SRC" "$DEST" \
+  # Double check yesterday's folder in case any were missed
+  "$RCLONE" copy "$YESTERDAY_SRC" "$DEST/$YESTERDAY_YEAR" \
   --min-age "${BUFFER_MIN}m" --max-depth 1 --ignore-case \
   --include "*.jpg" \
   --log-file "$LOG_FILENAME" --use-json-log --log-level INFO --stats-log-level DEBUG \
-  --ignore-existing --no-traverse --no-update-modtime
+  --ignore-existing --no-traverse --no-update-modtime \
+  || FAILED=1
+fi
+
+#  Upload
+"$RCLONE" copy "$SRC" "$DEST/$YEAR" \
+  --min-age "${BUFFER_MIN}m" --max-depth 1 --ignore-case \
+  --include "*.jpg" \
+  --log-file "$LOG_FILENAME" --use-json-log --log-level INFO --stats-log-level DEBUG \
+  --ignore-existing --no-traverse --no-update-modtime \
+  || FAILED=1
+
+  exit $FAILED

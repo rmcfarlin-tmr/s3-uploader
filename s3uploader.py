@@ -1,7 +1,7 @@
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import ttk
 from tkinter import messagebox
-from tkinter import simpledialog  
+from tkinter import simpledialog
 import subprocess
 import os
 import re
@@ -15,39 +15,21 @@ DOMAIN = f"gui/{os.getuid()}"
 SERVICE = f"{DOMAIN}/{LABEL}"
 PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 
-# main folder for photo team,
+# Main folder for the photo team. MUST match STAFF_DIR in upload.sh / install.sh
 STAFF_DIR = Path.home() / "S3_Uploader"
-UPLOAD_DIR = STAFF_DIR / "upload"
+IMAGES_DIR = STAFF_DIR / "images"          # images/<YYYY-MM>/<YYYY-MM-DD>/
 LOGS_DIR = STAFF_DIR / "logs"
 
 # Settings shared with upload.sh. MUST match CONFIG= in upload.sh and APP_DIR in install.sh
 CONFIG_DIR = Path.home() / "Library" / "Application Support" / "S3Uploader"
 CONFIG_PATH = CONFIG_DIR / "app.config"
 DEFAULT_CONFIG = {
-    "BACKUP_DIR": str(STAFF_DIR / "backups"),
+    "BUFFER_MIN": "10",
 }
 
-# Backup folder rules. The background job can only use folders inside these:
-ALLOWED_ROOTS = [Path.home(), Path("/Users/Shared")]
-
-# ...and never inside these (folder, reason shown to the user):
-MACOS_BLOCKED_MSG = (
-    "macOS doesn't let background tasks use Desktop, Documents, Downloads, "
-    "iCloud Drive or cloud folders like Dropbox.\n\n"
-    "Create a folder somewhere else in your home folder instead. You can add it "
-    "to the Finder sidebar (Ctrl+Cmd+T) or the Dock for quick access."
-)
-
-BLOCKED_DIRS = [
-    (Path.home() / "Desktop", MACOS_BLOCKED_MSG),
-    (Path.home() / "Documents", MACOS_BLOCKED_MSG),
-    (Path.home() / "Downloads", MACOS_BLOCKED_MSG),
-    (Path.home() / "Library", "Choose a folder outside the Library folder.\n\n" + MACOS_BLOCKED_MSG),
-    (Path.home() / ".Trash", "That folder is in the Trash."),
-    (UPLOAD_DIR, "The backup folder can't be inside the upload folder."),
-    (LOGS_DIR, "The backup folder can't be inside the logs folder."),
-]
-
+# Upload history: "Copied" log lines less than this many seconds apart belong to
+# the same run (runs are ~60 s apart; uploads within a run are seconds apart).
+RUN_GAP_SEC = 20
 
 
 # Config file (app.config)
@@ -72,45 +54,35 @@ def load_config():
 
 
 def save_config(cfg):
-    """Write ALL settings at once, atomically, so upload.sh never reads a half-written file."""
+    """Write all settings at once, atomically, so upload.sh never reads a half-written file.
+    Only known settings are written, so old keys (e.g. BACKUP_DIR) get cleaned out."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     text = "# Written by the S3 Uploader app. Read by upload.sh on every run.\n"
-    text += "".join(f"{key}={shlex.quote(str(value))}\n" for key, value in cfg.items())
+    text += "".join(f"{key}={shlex.quote(str(cfg[key]))}\n" for key in DEFAULT_CONFIG if key in cfg)
     tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, CONFIG_PATH)
 
 
-def check_backup_dir(chosen):
-    """Returns (ok, message). On success, message is the cleaned-up real path to save."""
-    path = Path(chosen).expanduser().resolve()       # follow symlinks, tidy the path
-
-    if path == Path.home().resolve():
-        return False, "Choose a folder inside your home folder, not the home folder itself."
-
-    if not any(path.is_relative_to(root.resolve()) for root in ALLOWED_ROOTS):
-        return False, (
-            "The backup folder has to be inside your home folder.\n\n"
-            "External drives, network drives and system folders can't be used by the "
-            "background uploader."
-        )
-
-    for blocked, reason in BLOCKED_DIRS:
-        if path.is_relative_to(blocked.resolve()):   # the folder itself, or anything inside it
-            return False, reason
-
-    if not path.is_dir():
-        return False, f"That folder doesn't exist:\n{path}"
-
-    # Real write test (more reliable than asking for permissions)
-    test_file = path / f".s3uploader_write_test_{os.getpid()}"
+def buffer_minutes():
     try:
-        test_file.write_text("ok")
-        test_file.unlink()
-    except OSError as e:
-        return False, f"Can't write to that folder:\n{e}"
+        return int(load_config().get("BUFFER_MIN", 10))
+    except ValueError:
+        return 10
 
-    return True, str(path)
+
+# Today's folder - same layout as upload.sh: images/<YYYY-MM>/<YYYY-MM-DD>
+# ---------------------------------------------------------------------------
+def today_dir():
+    now = datetime.datetime.now()
+    return IMAGES_DIR / now.strftime("%Y-%m") / now.strftime("%Y-%m-%d")
+
+
+def count_images(folder):
+    try:
+        return sum(1 for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".jpg")
+    except OSError:
+        return 0                                     # folder not created yet
 
 
 # Background job (launchd)
@@ -175,115 +147,145 @@ def get_status():
     return "Running", "green"
 
 
-
-# Logs & totals
+# Logs & totals - same names as upload.sh:
+#   logs/upload_logs/upload_logs_<YYYY-MM>/upload_log_<YYYY-MM-DD>.log
 # ---------------------------------------------------------------------------
-def read_logs(type):
-    cur_month = datetime.datetime.now().strftime("%Y-%m")
-    today_am = datetime.datetime.now().strftime("%Y-%m-%d") + "_AM"
-    today_pm = datetime.datetime.now().strftime("%Y-%m-%d") + "_PM"
+def today_log_path():
+    now = datetime.datetime.now()
+    return (LOGS_DIR / "upload_logs" / f"upload_logs_{now:%Y-%m}"
+            / f"upload_log_{now:%Y-%m-%d}.log")
 
-    log_dir = LOGS_DIR / f'{type}s' / f'{type}s_{cur_month}'
-    both_logs = [log_dir / f'{type}_{today_am}.log', log_dir / f'{type}_{today_pm}.log']
 
+def read_log(path):
     entries = []
-
-    for log in both_logs:
-        try:
-            with open(log, 'r', encoding='utf-8', errors='replace') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        # errs or echo lines
-                        entries.append({"time": None, "level": "raw", "msg": line})
-        except OSError:
-            continue                                 # no log yet for this half of the day
-
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # the script's own echo lines
+                    entries.append({"time": None, "level": "raw", "msg": line})
+    except OSError:
+        pass                                         # no log yet today
     return entries
 
 
-def get_totals(type):
-    # Count one line per file copied ("Copied (new)", "Copied (replaced existing)").
-    # rclone's "stats" summaries are cumulative and repeat every minute during long
-    # runs, so adding those up over-counts big batches.
-    total_files = 0
-    for entry in read_logs(type):
-        if str(entry.get("msg", "")).startswith("Copied"):
-            total_files += 1
-    return f'{total_files}'
+def uploaded_today():
+    # One "Copied (new)" line per file uploaded. Includes anything uploaded today
+    # from yesterday's folder (upload.sh logs both passes to today's log).
+    return sum(1 for e in read_log(today_log_path())
+               if str(e.get("msg", "")).startswith("Copied"))
 
 
-
-# Backup folder controls
+# Upload history
 # ---------------------------------------------------------------------------
-def current_backup_dir():
-    return load_config().get("BACKUP_DIR") or DEFAULT_CONFIG["BACKUP_DIR"]
-
-
-def choose_backup_folder():
-    cfg = load_config()
-    current = cfg.get("BACKUP_DIR") or DEFAULT_CONFIG["BACKUP_DIR"]
-    start_in = current if Path(current).is_dir() else str(Path.home())
-
-    chosen = filedialog.askdirectory(
-        parent=root,
-        title="Choose backup folder",
-        initialdir=start_in,
-        mustexist=True,
-    )
-    if not chosen:                                   # "" if they pressed Cancel
-        return
-
-    ok, result = check_backup_dir(chosen)
-    if not ok:
-        messagebox.showerror("Can't use that folder", result, parent=root)
-        return
-
-    cfg["BACKUP_DIR"] = result
+def parse_time(value):
+    """rclone time string -> datetime. Pads the fraction so Python 3.9/3.10 can read it."""
+    if not value:
+        return None
+    m = re.match(r"(.*T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(.*)$", value)
+    if not m:
+        return None
+    base, frac, tz = m.groups()
+    frac = ((frac or "") + "000000")[:6]
     try:
-        save_config(cfg)
-    except OSError as e:
-        messagebox.showerror("Couldn't save setting", str(e), parent=root)
+        return datetime.datetime.fromisoformat(f"{base}.{frac}{tz}")
+    except ValueError:
+        return None
+
+
+def upload_runs(entries):
+    """Group "Copied" lines into runs. Returns newest first: [(start_time, [filenames]), ...]"""
+    copies = []
+    for e in entries:
+        if not str(e.get("msg", "")).startswith("Copied"):
+            continue
+        t = parse_time(e.get("time"))
+        if t is not None:
+            copies.append((t, e.get("object") or "(unknown file)"))
+    copies.sort(key=lambda c: c[0])
+
+    runs, last = [], None
+    for t, name in copies:
+        if last is None or (t - last).total_seconds() > RUN_GAP_SEC:
+            runs.append((t, []))                     # gap -> new run
+        runs[-1][1].append(name)
+        last = t
+    runs.reverse()
+    return runs
+
+
+_history = {"path": None, "stat": None}             # what the list was last built from
+
+
+def refresh_history():
+    """Rebuild the history list, but only when today's log has changed."""
+    path = today_log_path()
+    try:
+        st = path.stat()
+        stat = (st.st_size, st.st_mtime)
+    except OSError:
+        stat = None                                  # no log yet today
+    if path == _history["path"] and stat == _history["stat"]:
         return
+    _history.update(path=path, stat=stat)
 
-    # Run the job now so any problem with the new folder shows up in Status immediately
-    if job_is_loaded():
-        _launchctl("kickstart", SERVICE)
+    # Remember what the user had open / selected / scrolled to
+    open_runs = {iid for iid in history_tree.get_children() if history_tree.item(iid, "open")}
+    selected = history_tree.selection()
+    scroll_pos = history_tree.yview()[0]
 
-    update_status_panel()
-    messagebox.showinfo(
-        "Backup folder updated",
-        f"New backups will go to:\n{result}\n\nExisting backups stay where they were.",
-        parent=root,
-    )
+    history_tree.delete(*history_tree.get_children())
+    runs = upload_runs(read_log(path))
+    for start, names in runs:
+        iid = f"run-{start.timestamp():.3f}"         # stable while a run is still growing
+        n = len(names)
+        label = f"{start.astimezone():%-I:%M %p}   Uploaded {n} image{'' if n == 1 else 's'}"
+        history_tree.insert("", "end", iid=iid, text=label, open=iid in open_runs)
+        for i, name in enumerate(sorted(names, key=str.lower)):
+            history_tree.insert(iid, "end", iid=f"{iid}-{i}", text=name)
+    if not runs:
+        history_tree.insert("", "end", iid="empty", text="No uploads yet today")
+
+    keep = [s for s in selected if history_tree.exists(s)]
+    if keep:
+        history_tree.selection_set(keep)
+    history_tree.yview_moveto(scroll_pos)
 
 
-def open_backup_folder():
-    folder = current_backup_dir()
-    if Path(folder).is_dir():
-        subprocess.run(["open", folder])
-    else:
-        messagebox.showerror("Folder not found", f"Backup folder doesn't exist:\n{folder}", parent=root)
+def on_history_click(event):
+    """Single click on a run row opens/closes it (clicking the arrow already does)."""
+    iid = history_tree.identify_row(event.y)
+    if not iid or history_tree.parent(iid) or not history_tree.get_children(iid):
+        return                                       # not a run row
+    if "indicator" in history_tree.identify_element(event.x, event.y):
+        return                                       # arrow click - Tk handles it
+    history_tree.item(iid, open=not history_tree.item(iid, "open"))
 
-# Set Buffer Time
+
+# Buttons
 # ---------------------------------------------------------------------------
+def open_today_folder():
+    folder = today_dir()
+    try:
+        folder.mkdir(parents=True, exist_ok=True)    # upload.sh creates it too; harmless
+    except OSError as e:
+        messagebox.showerror("Folder not found", f"Can't open today's folder:\n{folder}\n\n{e}", parent=root)
+        return
+    subprocess.run(["open", str(folder)])
+
 
 def set_buffer():
     cfg = load_config()
-    try:
-        current = int(cfg.get("BUFFER_MIN", 10))
-    except ValueError:
-        current = 10
-
     minutes = simpledialog.askinteger(
         "Upload buffer",
         "Minutes to wait before uploading a new image (2–60):",
         parent=root,
-        initialvalue=current,
+        initialvalue=buffer_minutes(),
         minvalue=2,
         maxvalue=60,
     )
@@ -297,12 +299,12 @@ def set_buffer():
         messagebox.showerror("Couldn't save setting", str(e), parent=root)
         return
 
+    update_status_panel()
     messagebox.showinfo(
         "Upload buffer updated",
-        f"New images will wait {minutes} minutes before uploading.",
+        f"Images will wait {minutes} minutes after their last save before uploading.",
         parent=root,
     )
-
 
 
 # Refresh
@@ -313,14 +315,13 @@ def update_status_panel():
     status_label.config(text=f'Status: {text}', fg=colour)
     start_stop_button.config(text="Start Uploader" if text == "Stopped" else "Stop Uploader")
 
-    upload_totals_label.config(text=f'Total Files Uploaded: {get_totals("upload_log")}')
-    backup_totals_label.config(text=f'Total Files Backed Up: {get_totals("backup_log")}')
+    folder = today_dir()
+    upload_totals_label.config(text=f'Uploaded today: {uploaded_today()}')
+    folder_totals_label.config(text=f"Images in today's folder: {count_images(folder)}")
+    buffer_label.config(text=f'Upload buffer: {buffer_minutes()} min')
+    today_label.config(text=f"Today's folder: {folder}")
 
-    folder = current_backup_dir()
-    if Path(folder).is_dir():
-        backup_dir_label.config(text=f'Backup folder: {folder}', fg="systemTextColor")  # follows Light/Dark Mode
-    else:
-        backup_dir_label.config(text=f'Backup folder: {folder}  (MISSING)', fg="red")
+    refresh_history()
 
 
 def tick():
@@ -334,7 +335,7 @@ def tick():
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("S3 Uploader")
-    root.geometry("600x400")
+    root.geometry("600x680")
 
     # Status + totals
     status_frame = tk.Frame(root)
@@ -343,27 +344,42 @@ if __name__ == "__main__":
     status_label = tk.Label(status_frame, text='Status: …', font=("Helvetica", 16, "bold"))
     status_label.pack()
 
-    upload_totals_label = tk.Label(status_frame, text='Total Files Uploaded: ')
-    backup_totals_label = tk.Label(status_frame, text='Total Files Backed Up: ')
+    upload_totals_label = tk.Label(status_frame, text='Uploaded today: ')
+    folder_totals_label = tk.Label(status_frame, text="Images in today's folder: ")
+    buffer_label = tk.Label(status_frame, text='Upload buffer: ')
     upload_totals_label.pack()
-    backup_totals_label.pack()
+    folder_totals_label.pack()
+    buffer_label.pack()
 
     start_stop_button = tk.Button(status_frame, text="Start/Stop Uploader", command=toggle_job)
     start_stop_button.pack(pady=10)
 
-    # Backup folder
-    backup_frame = tk.Frame(root)
-    backup_frame.pack(side="top", pady=10)
+    # Today's folder
+    folder_frame = tk.Frame(root)
+    folder_frame.pack(side="top", pady=10)
 
-    backup_dir_label = tk.Label(backup_frame, text='Backup folder: …', wraplength=560)
-    backup_dir_label.pack()
+    today_label = tk.Label(folder_frame, text="Today's folder: …", wraplength=560)
+    today_label.pack()
 
-    backup_buttons = tk.Frame(backup_frame)
-    backup_buttons.pack(pady=6)
-    tk.Button(backup_buttons, text="Change Backup Folder…", command=choose_backup_folder).pack(side="bottom", padx=4)
-    tk.Button(backup_buttons, text="Set Upload Buffer Time", command=set_buffer).pack(side="bottom", pady=4)
-    tk.Button(backup_buttons, text="Open Backup Folder", command=open_backup_folder).pack(side="bottom", padx=4)
+    folder_buttons = tk.Frame(folder_frame)
+    folder_buttons.pack(pady=6)
+    tk.Button(folder_buttons, text="Open Today's Folder", command=open_today_folder).pack(pady=2)
+    tk.Button(folder_buttons, text="Set Upload Buffer Time", command=set_buffer).pack(pady=2)
 
+    # Upload history (today) - newest first; click a run to see its files
+    history_frame = tk.Frame(root)
+    history_frame.pack(side="top", fill="both", expand=True, padx=12, pady=(4, 12))
+
+    tk.Label(history_frame, text="Upload history - today", font=("Helvetica", 13, "bold")).pack(anchor="w")
+
+    tree_box = tk.Frame(history_frame)
+    tree_box.pack(fill="both", expand=True)
+    history_tree = ttk.Treeview(tree_box, show="tree", selectmode="browse")
+    history_scroll = ttk.Scrollbar(tree_box, orient="vertical", command=history_tree.yview)
+    history_tree.configure(yscrollcommand=history_scroll.set)
+    history_scroll.pack(side="right", fill="y")
+    history_tree.pack(side="left", fill="both", expand=True)
+    history_tree.bind("<ButtonRelease-1>", on_history_click)
 
     tick()
     root.mainloop()

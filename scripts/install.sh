@@ -8,8 +8,9 @@
 # Run from anywhere:
 #     bash /path/to/package/scripts/install.sh
 #
-# Optional: use a specific Python instead of the first python3 on PATH:
-#     PYTHON=/path/to/python3 bash install.sh
+# Optional: use a specific Python instead of the first python3 on PATH
+# (put it BEFORE the command):
+#     PYTHON=/path/to/python3 bash /path/to/package/scripts/install.sh
 #
 # Safe to run again. It updates the app + script, rewrites the background job,
 # and rebuilds the launcher, but NEVER overwrites app.config (staff settings).
@@ -18,7 +19,7 @@
 LABEL="com.tmraudio.s3upload"
 INTERVAL=60                                        # seconds between runs
 
-SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"     # folder this installer is in
+SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"       # folder this installer is in
 PKG_DIR="$(cd "$SCRIPTS_DIR/.." && pwd)"           # package root (one level up)
 SRC_APP="$PKG_DIR/s3uploader.py"
 SRC_SCRIPT="$SCRIPTS_DIR/upload.sh"
@@ -26,6 +27,8 @@ SRC_SCRIPT="$SCRIPTS_DIR/upload.sh"
 APP_DIR="$HOME/Library/Application Support/S3Uploader"
 CONFIG="$APP_DIR/app.config"
 STAFF_DIR="$HOME/S3_Uploader"
+IMAGES_DIR="$STAFF_DIR/images"
+TODAY_DIR="$IMAGES_DIR/$(date +%Y-%m)/$(date +%Y-%m-%d)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LAUNCHER="$HOME/Applications/S3 Uploader.app"
 RCLONE="/usr/local/bin/rclone"
@@ -39,13 +42,17 @@ die()  { echo; echo "   [x] $*"; echo; echo "Install stopped at this step."; exi
 
 
 # ---------------------------------------------------------------------------
-step "1. Checking this Mac"
+step "1. Checking this Mac and the package"
 # ---------------------------------------------------------------------------
 [ "$(uname)" = "Darwin" ] || die "This installer is for macOS."
 [ "$(id -u)" -ne 0 ]      || die "Don't run this with sudo. Run it as the user who will use the uploader."
 [ -f "$SRC_APP" ]         || die "Can't find s3uploader.py in the package folder:  $SRC_APP"
 [ -f "$SRC_SCRIPT" ]      || die "Can't find scripts/upload.sh:  $SRC_SCRIPT"
 ok "Package files found in $PKG_DIR"
+
+bash -n "$SRC_SCRIPT" 2>/dev/null \
+  || die "scripts/upload.sh has a syntax error. See it with:  bash -n \"$SRC_SCRIPT\""
+ok "upload.sh syntax OK"
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +81,10 @@ if ! awk -v v="$TK_VER" 'BEGIN { exit !(v >= 8.6) }'; then
 fi
 ok "Python $PY_MAJOR.$PY_MINOR with Tk $TK_VER at $PYTHON"
 
+"$PYTHON" -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$SRC_APP" 2>/dev/null \
+  || die "s3uploader.py has a Python syntax error. See it with:  \"$PYTHON\" -m py_compile \"$SRC_APP\""
+ok "s3uploader.py syntax OK"
+
 case "$PYTHON" in
   */.local/share/uv/*|*/.pyenv/*|*/.venv/*|*/venv/*)
     warn "This Python is managed by a dev tool (uv / pyenv / venv). The launcher will break"
@@ -99,14 +110,14 @@ DEST_COUNT="$(printf '%s\n' "$ACTIVE_DEST_LINES" | grep -c 'DEST=')"
 
 ACTIVE_DEST="${ACTIVE_DEST_LINES#*=}"
 ACTIVE_DEST="${ACTIVE_DEST%%#*}"                   # drop any trailing comment
-ACTIVE_DEST="$(printf '%s' "$ACTIVE_DEST" | sed -e 's/[[:space:]]*$//' -e 's/"//g' -e "s/\$(date +%Y)/$(date +%Y)/")"
+ACTIVE_DEST="$(printf '%s' "$ACTIVE_DEST" | sed -e 's/[[:space:]]*$//' -e 's/"//g' -e 's#/*$##')"
 case "$ACTIVE_DEST" in
   *rclone_test*) MODE="TEST destination" ;;
   *)             MODE="LIVE - product images go public" ;;
 esac
 
 echo
-echo "   Uploads will go to:  $ACTIVE_DEST"
+echo "   Uploads will go to:  $ACTIVE_DEST/<year>/"
 echo "   Mode:                $MODE"
 echo
 read -r -p "   Is that correct? Type 'yes' to continue: " ANSWER
@@ -116,11 +127,12 @@ read -r -p "   Is that correct? Type 'yes' to continue: " ANSWER
 # ---------------------------------------------------------------------------
 step "5. Creating folders"
 # ---------------------------------------------------------------------------
-mkdir -p "$STAFF_DIR/upload" "$STAFF_DIR/logs" "$STAFF_DIR/backups" \
+mkdir -p "$TODAY_DIR" "$STAFF_DIR/logs" \
          "$APP_DIR" "$HOME/Library/LaunchAgents" "$HOME/Applications" \
   || die "Couldn't create folders."
-ok "Staff folder:  $STAFF_DIR  (upload, logs, backups)"
-ok "App folder:    $APP_DIR"
+ok "Staff folder:   $STAFF_DIR  (images, logs)"
+ok "Today's folder: $TODAY_DIR"
+ok "App folder:     $APP_DIR"
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +154,6 @@ if [ -f "$CONFIG" ]; then
 else
   cat > "$CONFIG" <<EOF
 # Written by the S3 Uploader app. Read by upload.sh on every run.
-BACKUP_DIR='$STAFF_DIR/backups'
 BUFFER_MIN=10
 EOF
   [ -f "$CONFIG" ] || die "Couldn't write $CONFIG"
@@ -198,18 +209,19 @@ step "Done"
 # ---------------------------------------------------------------------------
 cat <<EOF
 
-   Uploads to:     $ACTIVE_DEST   ($MODE)
-   Drop images in: $STAFF_DIR/upload
+   Uploads to:     $ACTIVE_DEST/<year>/   ($MODE)
+   Today's folder: $TODAY_DIR
+                   (a new YYYY-MM/YYYY-MM-DD folder is created each day)
    Settings:       $CONFIG
    Logs:           $STAFF_DIR/logs
 
    Still to do by hand:
      1. Open "S3 Uploader" (Finder window opening now) and drag it to the Dock.
-     2. Add $STAFF_DIR/upload and the backup folder to the Finder sidebar (Ctrl+Cmd+T).
+     2. Add $IMAGES_DIR to the Finder sidebar (Ctrl+Cmd+T).
      3. System Settings > General > Login Items: allow the job in the background.
      4. System Settings > Energy: prevent automatic sleep; start up after power failure.
-     5. Point the Photoshop export/action at $STAFF_DIR/upload
-     6. Test: one new image + one already in S3; check backup, S3, and the upload folder.
+     5. Point Photoshop + the viewer at today's folder (repoint each morning).
+     6. Test: one new image uploads; one already in S3 is skipped; both stay in today's folder.
 
 EOF
 open -R "$LAUNCHER" 2>/dev/null

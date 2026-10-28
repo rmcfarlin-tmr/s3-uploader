@@ -1,0 +1,14 @@
+launchctl bootout gui/$(id -u)/com.tmraudio.s3upload 2>/dev/null
+launchctl enable gui/$(id -u)/com.tmraudio.s3upload
+rm -f ~/Library/LaunchAgents/com.tmraudio.s3upload.plist
+pkill rclone 2>/dev/null
+pkill -f s3uploader.py 2>/dev/null
+rm -rf ~/Applications/S3\ Uploader.app
+STAMP=$(date +%m%d-%H%M)
+[ -d ~/S3_Uploader ] && mv ~/S3_Uploader ~/S3_Uploader_old_$STAMP
+[ -d ~/Library/Application\ Support/S3Uploader ] && mv ~/Library/Application\ Support/S3Uploader ~/S3Uploader_app_old_$STAMP
+echo "--- check ---"
+launchctl print gui/$(id -u)/com.tmraudio.s3upload 2>&1 | head -1
+pgrep -l rclone || echo "no rclone running"
+ls -d ~/S3_Uploader ~/Library/Application\ Support/S3Uploader 2>&1
+rclone listremotes
